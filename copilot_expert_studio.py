@@ -50,9 +50,15 @@ from PySide6.QtWidgets import (
 from qasync import QEventLoop, asyncSlot
 
 # GitHub Copilot Python SDK
-# Docs show the package is installed as `github-copilot-sdk` and imported as `copilot`.
+# Package: `pip install github-copilot-sdk` — imported as `copilot`.
+# Docs: https://github.com/github/copilot-sdk/tree/main/python
 from copilot import CopilotClient
-from copilot.session import PermissionHandler
+from copilot.generated.session_events import (
+    AssistantMessageData,
+    AssistantMessageDeltaData,
+    SessionIdleData,
+)
+from copilot.session import PermissionRequestResult
 
 
 APP_TITLE = "Copilot Expert Studio"
@@ -79,12 +85,19 @@ class ExpertProfile:
     description: str
     markdown: str
 
+    @staticmethod
+    def _yaml_escape(value: str) -> str:
+        """Escape a string for safe inclusion in a double-quoted YAML value."""
+        return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
     def to_agent_markdown(self, model: str = "gpt-5") -> str:
-        safe_name = self.name.strip() or "expert-agent"
+        safe_name = self._yaml_escape(self.name.strip() or "expert-agent")
+        safe_desc = self._yaml_escape(self.description.strip() or "Specialist coding agent")
+        safe_model = self._yaml_escape(model.strip() or "gpt-5")
         return f"""---
 name: "{safe_name}"
-description: "{self.description.strip() or 'Specialist coding agent'}"
-model: "{model}"
+description: "{safe_desc}"
+model: "{safe_model}"
 user-invocable: true
 disable-model-invocation: false
 ---
@@ -111,6 +124,15 @@ class ChatWorker(QObject):
         self.model = model if model != "auto" else "gpt-5"
         self.cwd = cwd
 
+    @staticmethod
+    def _permission_handler(request, invocation) -> PermissionRequestResult:
+        """Allow reads and custom tools; deny shell commands and file writes."""
+        kind = getattr(request, "kind", None)
+        kind_value = getattr(kind, "value", str(kind)) if kind else ""
+        if kind_value in ("shell", "write"):
+            return PermissionRequestResult(kind="denied-interactively-by-user")
+        return PermissionRequestResult(kind="approved")
+
     async def run(self) -> None:
         client = None
         try:
@@ -118,64 +140,45 @@ class ChatWorker(QObject):
             client = CopilotClient()
             await client.start()
 
-            # Streaming/event contracts in preview may shift. Keep the event handling defensive.
-            session = await client.create_session(
-                model=self.model,
-                on_permission_request=PermissionHandler.approve_all,
-                system_message={"content": self.system_message} if self.system_message.strip() else None,
-            )
+            session_kwargs: dict = {
+                "model": self.model,
+                "on_permission_request": self._permission_handler,
+                "streaming": True,
+            }
+            if self.system_message.strip():
+                session_kwargs["system_message"] = {
+                    "mode": "replace",
+                    "content": self.system_message,
+                }
+
+            session = await client.create_session(**session_kwargs)
 
             idle_event = asyncio.Event()
 
             def on_event(event):
                 try:
-                    event_type = getattr(event, "type", "")
-                    data = getattr(event, "data", None)
-
-                    if event_type in {"assistant_message", "assistant.message"}:
-                        content = getattr(data, "content", None)
-                        if content:
-                            self.chunk.emit(str(content))
-                    elif event_type in {"assistant_message_delta", "assistant.message.delta"}:
-                        delta = getattr(data, "delta", None) or getattr(data, "content", None)
-                        if delta:
-                            self.chunk.emit(str(delta))
-                    elif event_type in {"session_idle", "session.idle"}:
-                        idle_event.set()
-                except Exception as exc:  # pragma: no cover - defensive UI handling
+                    match event.data:
+                        case AssistantMessageDeltaData() as data:
+                            delta = data.delta_content or ""
+                            if delta:
+                                self.chunk.emit(delta)
+                        case AssistantMessageData() as data:
+                            pass  # final message; deltas already streamed
+                        case SessionIdleData():
+                            idle_event.set()
+                except Exception as exc:
                     self.error.emit(f"Event handling error: {exc}")
 
-            try:
-                session.on(on_event)
-            except Exception:
-                # Some SDK revisions may expose a different event wiring surface.
-                pass
+            session.on(on_event)
 
             self.status.emit("Sending prompt to Copilot...")
-            send_result = None
-            # Prefer send(), then wait for idle. Fallback to send_and_wait().
-            if hasattr(session, "send"):
-                await session.send(self.prompt)
-                try:
-                    await asyncio.wait_for(idle_event.wait(), timeout=180)
-                except asyncio.TimeoutError:
-                    self.status.emit("Response timeout reached; stopping wait.")
-            elif hasattr(session, "send_and_wait"):
-                send_result = await session.send_and_wait({"prompt": self.prompt})
-            else:
-                raise RuntimeError("Unsupported Copilot SDK session interface; neither send() nor send_and_wait() exists.")
+            await session.send(self.prompt)
+            try:
+                await asyncio.wait_for(idle_event.wait(), timeout=180)
+            except asyncio.TimeoutError:
+                self.status.emit("Response timeout reached; stopping wait.")
 
-            if send_result is not None:
-                data = getattr(send_result, "data", None)
-                content = getattr(data, "content", None)
-                if content:
-                    self.chunk.emit(str(content))
-
-            # Best-effort cleanup
-            if hasattr(session, "close"):
-                maybe = session.close()
-                if asyncio.iscoroutine(maybe):
-                    await maybe
+            await session.disconnect()
 
         except Exception as exc:
             self.error.emit(str(exc))
@@ -589,7 +592,7 @@ You are a senior Node.js engineer and technical reviewer.
             "Apply the following expert markdown exactly as durable guidance:",
             profile.markdown.strip(),
         ]
-        return "\n".join(p for p in parts if p is not None)
+        return "\n".join(p for p in parts if p)
 
     def build_chat_prompt(self) -> str:
         user_prompt = self.user_prompt.toPlainText().strip()
@@ -682,7 +685,6 @@ You are a senior Node.js engineer and technical reviewer.
         path, _ = QFileDialog.getSaveFileName(self, "Save markdown", str(Path.cwd() / f"{self.profile_name.text() or 'expert'}.md"), "Markdown (*.md)")
         if not path:
             return
-        self.build_profile().to_instruction_markdown()
         Path(path).write_text(self.markdown_editor.toPlainText(), encoding="utf-8")
         self.set_status(f"Saved markdown: {path}")
 
