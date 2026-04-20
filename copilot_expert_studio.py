@@ -88,7 +88,14 @@ class ExpertProfile:
     @staticmethod
     def _yaml_escape(value: str) -> str:
         """Escape a string for safe inclusion in a double-quoted YAML value."""
-        return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+        return (
+            value
+            .replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("\t", "\\t")
+        )
 
     def to_agent_markdown(self, model: str = "gpt-5") -> str:
         safe_name = self._yaml_escape(self.name.strip() or "expert-agent")
